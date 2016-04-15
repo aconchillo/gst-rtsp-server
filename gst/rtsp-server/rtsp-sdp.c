@@ -16,6 +16,9 @@
  * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
  * Boston, MA 02110-1301, USA.
  */
+
+#define GLIB_DISABLE_DEPRECATION_WARNINGS
+
 /**
  * SECTION:rtsp-sdp
  * @short_description: Make SDP messages
@@ -72,6 +75,92 @@ update_sdp_from_tags (GstRTSPStream * stream, GstSDPMedia * stream_media)
   gst_object_unref (src_pad);
 }
 
+static guint
+get_roc_from_stats (GstStructure * stats, guint ssrc)
+{
+  const GValue *va, *v;
+  guint i, len;
+  /* initialize roc to something different than 0, so if we don't get
+     the proper ROC from the encoder, streaming should fail initially. */
+  guint roc = -1;
+
+  va = gst_structure_get_value (stats, "streams");
+  if (!va || !G_VALUE_HOLDS (va, GST_TYPE_ARRAY)) {
+    GST_WARNING ("stats doesn't have a valid 'streams' field");
+    return 0;
+  }
+
+  len = gst_value_array_get_size (va);
+
+  /* look if there's any SSRC that matches. */
+  for (i = 0; i < len; i++) {
+    GstStructure *stream;
+    v = gst_value_array_get_value (va, i);
+    if (v && (stream = g_value_get_boxed (v))) {
+      guint stream_ssrc;
+      gst_structure_get_uint (stream, "ssrc", &stream_ssrc);
+      if (stream_ssrc == ssrc) {
+        gst_structure_get_uint (stream, "roc", &roc);
+        break;
+      } else {
+        GST_WARNING ("unable to obtain ROC for stream with SSRC %u", ssrc);
+      }
+    }
+  }
+
+  return roc;
+}
+
+static void
+mikey_add_crypto_sessions (GstRTSPStream * stream, GstMIKEYMessage * msg)
+{
+  guint i;
+  GObject *session;
+  GstElement *encoder;
+  GValueArray *sources;
+
+  session = gst_rtsp_stream_get_rtpsession (stream);
+  if (session == NULL)
+    return;
+
+  encoder = gst_rtsp_stream_get_srtp_encoder (stream);
+  if (encoder == NULL) {
+    g_object_unref (session);
+    return;
+  }
+
+  g_object_get (session, "sources", &sources, NULL);
+  for (i = 0; i < sources->n_values; i++) {
+    GValue *val;
+    GObject *source;
+    guint32 ssrc;
+    gboolean is_sender;
+
+    val = g_value_array_get_nth (sources, i);
+    source = (GObject *) g_value_get_object (val);
+
+    g_object_get (source, "ssrc", &ssrc, "is-sender", &is_sender, NULL);
+
+    if (is_sender) {
+      guint32 roc = 0;
+      GstStructure *stats;
+
+      g_object_get (encoder, "stats", &stats, NULL);
+
+      if (stats) {
+        roc = get_roc_from_stats (stats, ssrc);
+        gst_structure_free (stats);
+      }
+
+      gst_mikey_message_add_cs_srtp (msg, 0, ssrc, roc);
+    }
+  }
+  g_value_array_free (sources);
+
+  gst_object_unref (encoder);
+  g_object_unref (session);
+}
+
 static void
 make_media (GstSDPMessage * sdp, GstSDPInfo * info,
     GstRTSPStream * stream, GstCaps * caps, GstRTSPProfile profile)
@@ -85,7 +174,6 @@ make_media (GstSDPMessage * sdp, GstSDPInfo * info,
   guint ttl;
   GstClockTime rtx_time;
   gchar *base64;
-  guint32 ssrc;
   GstMIKEYMessage *mikey_msg;
 
   gst_sdp_media_new (&smedia);
@@ -154,9 +242,8 @@ make_media (GstSDPMessage * sdp, GstSDPInfo * info,
   /* check for srtp */
   mikey_msg = gst_mikey_message_new_from_caps (caps);
   if (mikey_msg) {
-    gst_rtsp_stream_get_ssrc (stream, &ssrc);
-    /* add policy '0' for our SSRC */
-    gst_mikey_message_add_cs_srtp (mikey_msg, 0, ssrc, 0);
+    /* add policy '0' for all sending SSRC */
+    mikey_add_crypto_sessions (stream, mikey_msg);
 
     base64 = gst_mikey_message_base64_encode (mikey_msg);
     if (base64) {
